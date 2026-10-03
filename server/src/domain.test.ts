@@ -22,3 +22,43 @@ test('appointment and task domain operations support create, update and delete',
   assert.equal(updateYardTask(task.id, { to: '北闸口' })?.to, '北闸口');
   assert.equal(deleteYardTask(task.id)?.id, task.id);
 });
+
+test('task status machine rejects illegal transitions and explains the allowed next steps', async () => {
+  const { createYardTask, updateYardTask, deleteYardTask } = await import('./domain.js');
+  const task = createYardTask({ kind: 'deliver', containerId: 'MSCU-4829017', from: 'A01-R01-T1', to: '南闸口', priority: 50, scheduledAt: new Date().toISOString(), estimatedMinutes: 15 });
+  assert.throws(() => updateYardTask(task.id, { status: 'done' }), /非法状态转换.*排队.*已完成/);
+  assert.throws(() => updateYardTask(task.id, { status: 'executing' }), /非法状态转换/);
+  assert.equal(updateYardTask(task.id, { status: 'assigned', equipmentId: 'YC-05' })?.status, 'assigned');
+  assert.equal(updateYardTask(task.id, { status: 'executing' })?.status, 'executing');
+  assert.throws(() => updateYardTask(task.id, { to: '北闸口' }), /执行中/);
+  assert.throws(() => updateYardTask(task.id, { status: 'queued' }), /非法状态转换/);
+  assert.equal(updateYardTask(task.id, { status: 'done' })?.status, 'done');
+  assert.throws(() => updateYardTask(task.id, { status: 'queued' }), /终态/);
+  assert.throws(() => updateYardTask(task.id, { priority: 60 }), /终态/);
+  deleteYardTask(task.id);
+});
+
+test('assigning and blocking a task enforce equipment rules and blocking reasons', async () => {
+  const { createYardTask, updateYardTask, deleteYardTask } = await import('./domain.js');
+  const task = createYardTask({ kind: 'deliver', containerId: 'MSCU-4829017', from: 'A01-R01-T1', to: '南闸口', priority: 50, scheduledAt: new Date().toISOString(), estimatedMinutes: 15 });
+  assert.throws(() => updateYardTask(task.id, { status: 'assigned' }), /必须选择一台可用设备/);
+  assert.throws(() => updateYardTask(task.id, { status: 'assigned', equipmentId: 'RS-02' }), /维护中/);
+  assert.throws(() => updateYardTask(task.id, { status: 'blocked' }), /阻塞原因/);
+  const blocked = updateYardTask(task.id, { status: 'blocked', blockingReason: '待海关查验窗口' });
+  assert.equal(blocked?.status, 'blocked');
+  assert.ok(blocked?.blockingReasons.includes('待海关查验窗口'));
+  const resumed = updateYardTask(task.id, { status: 'queued' });
+  assert.equal(resumed?.status, 'queued');
+  assert.deepEqual(resumed?.blockingReasons, []);
+  assert.equal(updateYardTask(task.id, { status: 'assigned', equipmentId: 'YC-05' })?.equipmentId, 'YC-05');
+  assert.throws(() => updateYardTask(task.id, { equipmentId: '' }), /必须保留设备/);
+  deleteYardTask(task.id);
+});
+
+test('inspect tasks require a reach stacker and done tasks reject reassignment', async () => {
+  const { createYardTask, updateYardTask, assignTask, deleteYardTask } = await import('./domain.js');
+  const inspect = createYardTask({ kind: 'inspect', containerId: 'TGHU-9831204', from: 'D05-R02-T1', to: 'D05-R02-T1', priority: 80, scheduledAt: new Date().toISOString(), estimatedMinutes: 30 });
+  assert.throws(() => updateYardTask(inspect.id, { status: 'assigned', equipmentId: 'YC-05' }), /正面吊/);
+  deleteYardTask(inspect.id);
+  assert.throws(() => assignTask('TASK-105', 'YC-05'), /已完成/);
+});
