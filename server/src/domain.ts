@@ -86,12 +86,37 @@ export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' |
   const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false }; appointments.unshift(item); container.appointmentId = item.id; return item;
 }
 export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
-export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
+export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; if (task.status === 'done') throw new Error(`任务 ${id} 已完成，不能再指派设备`); if (task.status === 'executing') throw new Error(`任务 ${id} 正在作业中，不能改派设备；如需调整请先标记阻塞`); const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
 export function containerDetail(id: string) { const container = containers.find(item => item.id === id); if (!container) return undefined; return { container, voyage: voyages.find(v => v.id === container.voyageId), appointment: appointments.find(a => a.id === container.appointmentId), plan: containerPlan(id), tasks: tasks.filter(t => t.containerId === id) }; }
 
 export type ContainerInput = Omit<Container, 'lastEvent' | 'appointmentId'> & { appointmentId?: string };
 export type AppointmentInput = Pick<GateAppointment, 'containerId' | 'truckNo' | 'driver' | 'type' | 'windowStart' | 'windowEnd' | 'lane'>;
 export type TaskInput = Pick<YardTask, 'kind' | 'containerId' | 'from' | 'to' | 'priority' | 'scheduledAt' | 'estimatedMinutes'> & { equipmentId?: string };
+
+export const TASK_STATUS_LABELS: Record<TaskStatus, string> = { queued: '排队中', assigned: '已指派', executing: '作业中', blocked: '已阻塞', done: '已完成' };
+export const TASK_STATUS_FLOW: Record<TaskStatus, TaskStatus[]> = {
+  queued: ['assigned', 'blocked'],
+  assigned: ['executing', 'queued', 'blocked'],
+  executing: ['done', 'blocked'],
+  blocked: ['queued', 'assigned'],
+  done: []
+};
+
+export function taskTransitionError(task: YardTask, next: TaskStatus): string | undefined {
+  if (next === task.status) return undefined;
+  if (task.status === 'done') return `任务 ${task.id} 已完成，状态为终态不可回退；如需继续作业请创建新任务`;
+  const allowed = TASK_STATUS_FLOW[task.status];
+  if (!allowed.includes(next)) return `不允许从「${TASK_STATUS_LABELS[task.status]}」直接变更为「${TASK_STATUS_LABELS[next] ?? next}」；当前可流转：${allowed.map(status => `「${TASK_STATUS_LABELS[status]}」`).join('、')}`;
+  return undefined;
+}
+
+function assertEquipmentAssignable(kind: YardTask['kind'], equipmentId: string) {
+  const machine = equipment.find(item => item.id === equipmentId);
+  if (!machine) throw new Error(`设备 ${equipmentId} 不存在`);
+  if (machine.status === 'maintenance' || machine.status === 'offline') throw new Error(`${machine.name} 当前${machine.status === 'maintenance' ? '维护中' : '离线'}，不能指派；请改派其他设备或将任务标记为阻塞`);
+  if (kind === 'inspect' && machine.kind !== 'reach-stacker') throw new Error('查验作业需要正面吊或专用设备');
+  return machine;
+}
 
 function recordAudit(action: string, entity: string, entityId: string, details: string) {
   auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action, entity, entityId, at: new Date().toISOString(), details });
@@ -182,6 +207,7 @@ export function createYardTask(input: TaskInput) {
   if (!containers.some(container => container.id === input.containerId)) throw new Error('关联箱号不存在');
   if (input.priority < 1 || input.priority > 100) throw new Error('优先级范围为 1–100');
   if (input.estimatedMinutes <= 0) throw new Error('预计作业时长必须大于 0');
+  if (input.equipmentId) assertEquipmentAssignable(input.kind, input.equipmentId);
   const item: YardTask = { ...input, id: `TASK-${Date.now()}`, status: input.equipmentId ? 'assigned' : 'queued', blockingReasons: [], scheduledAt: input.scheduledAt };
   tasks.unshift(item);
   recordAudit('CREATE', 'yard-task', item.id, `创建 ${input.kind} 任务，关联 ${input.containerId}`);
@@ -191,10 +217,31 @@ export function createYardTask(input: TaskInput) {
 export function updateYardTask(id: string, patch: Partial<TaskInput & Pick<YardTask, 'status' | 'blockingReasons'>>) {
   const item = tasks.find(task => task.id === id);
   if (!item) return undefined;
+  if (item.status === 'done') throw new Error(`任务 ${id} 已完成，档案已封存仅可查看；如需继续作业请创建新任务`);
   if (patch.containerId && !containers.some(container => container.id === patch.containerId)) throw new Error('关联箱号不存在');
   if (patch.priority !== undefined && (patch.priority < 1 || patch.priority > 100)) throw new Error('优先级范围为 1–100');
-  Object.assign(item, patch);
-  recordAudit('UPDATE', 'yard-task', id, `更新场内作业任务：${JSON.stringify(patch)}`);
+  if (patch.status !== undefined && !Object.prototype.hasOwnProperty.call(TASK_STATUS_FLOW, patch.status)) throw new Error(`未知任务状态：${patch.status}`);
+  const previousStatus = item.status;
+  const nextStatus = patch.status ?? item.status;
+  const statusChanged = nextStatus !== previousStatus;
+  if (statusChanged) {
+    const problem = taskTransitionError(item, nextStatus as TaskStatus);
+    if (problem) throw new Error(problem);
+  }
+  const equipmentTouched = patch.equipmentId !== undefined && (patch.equipmentId || undefined) !== item.equipmentId;
+  const nextEquipmentId = patch.equipmentId !== undefined ? patch.equipmentId || undefined : item.equipmentId;
+  if ((statusChanged || equipmentTouched) && (nextStatus === 'assigned' || nextStatus === 'executing')) {
+    if (!nextEquipmentId) throw new Error(`状态「${TASK_STATUS_LABELS[nextStatus]}」要求已指派设备，请先选择设备`);
+    assertEquipmentAssignable(patch.kind ?? item.kind, nextEquipmentId);
+  }
+  if (statusChanged && nextStatus === 'blocked') {
+    const reasons = patch.blockingReasons ?? item.blockingReasons;
+    if (!reasons.length) throw new Error('变更为「已阻塞」必须填写阻塞原因');
+  }
+  const normalized: Partial<TaskInput & Pick<YardTask, 'status' | 'blockingReasons'>> = { ...patch, equipmentId: nextEquipmentId };
+  if (statusChanged && previousStatus === 'blocked' && nextStatus !== 'blocked' && patch.blockingReasons === undefined) normalized.blockingReasons = [];
+  Object.assign(item, normalized);
+  recordAudit('UPDATE', 'yard-task', id, statusChanged ? `状态 ${previousStatus} → ${nextStatus}：${JSON.stringify(patch)}` : `更新场内作业任务：${JSON.stringify(patch)}`);
   return item;
 }
 

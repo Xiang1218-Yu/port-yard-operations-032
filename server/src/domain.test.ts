@@ -22,3 +22,35 @@ test('appointment and task domain operations support create, update and delete',
   assert.equal(updateYardTask(task.id, { to: '北闸口' })?.to, '北闸口');
   assert.equal(deleteYardTask(task.id)?.id, task.id);
 });
+
+test('task status flow enforces legal transitions, equipment and blocking reason rules', async () => {
+  const { createYardTask, updateYardTask, deleteYardTask, assignTask } = await import('./domain.js');
+  const task = createYardTask({ kind: 'deliver', containerId: 'MSCU-4829017', from: 'A01-R01-T1', to: '南闸口', priority: 40, scheduledAt: new Date().toISOString(), estimatedMinutes: 12 });
+  assert.throws(() => updateYardTask(task.id, { status: 'done' }), /不允许从「排队中」直接变更为「已完成」/);
+  assert.throws(() => updateYardTask(task.id, { status: 'executing' }), /不允许从「排队中」/);
+  assert.throws(() => updateYardTask(task.id, { status: 'assigned' }), /必须先选择设备|要求已指派设备/);
+  assert.throws(() => updateYardTask(task.id, { status: 'assigned', equipmentId: 'RS-02' }), /维护中|不能指派/);
+  assert.throws(() => updateYardTask(task.id, { status: 'blocked' }), /阻塞原因/);
+  const blocked = updateYardTask(task.id, { status: 'blocked', blockingReasons: ['等待海关查验窗口'] });
+  assert.equal(blocked?.status, 'blocked');
+  const requeued = updateYardTask(task.id, { status: 'queued' });
+  assert.equal(requeued?.status, 'queued');
+  assert.deepEqual(requeued?.blockingReasons, []);
+  assert.equal(updateYardTask(task.id, { status: 'assigned', equipmentId: 'YC-05' })?.status, 'assigned');
+  assert.throws(() => updateYardTask(task.id, { status: 'done' }), /不允许从「已指派」/);
+  assert.equal(updateYardTask(task.id, { status: 'executing' })?.status, 'executing');
+  assert.throws(() => updateYardTask(task.id, { status: 'queued' }), /不允许从「作业中」/);
+  assert.equal(updateYardTask(task.id, { status: 'done' })?.status, 'done');
+  assert.throws(() => updateYardTask(task.id, { status: 'queued' }), /已完成/);
+  assert.throws(() => updateYardTask(task.id, { priority: 60 }), /已完成/);
+  assert.throws(() => assignTask(task.id, 'YC-05'), /已完成/);
+  assert.equal(deleteYardTask(task.id)?.id, task.id);
+});
+
+test('inspect tasks require reach-stacker equipment when assigned through the edit flow', async () => {
+  const { createYardTask, updateYardTask, deleteYardTask } = await import('./domain.js');
+  const task = createYardTask({ kind: 'inspect', containerId: 'TGHU-9831204', from: 'D05-R02-T1', to: 'D05-R02-T1', priority: 90, scheduledAt: new Date().toISOString(), estimatedMinutes: 30 });
+  assert.throws(() => updateYardTask(task.id, { status: 'assigned', equipmentId: 'YC-05' }), /正面吊/);
+  assert.throws(() => createYardTask({ kind: 'deliver', containerId: 'MSCU-4829017', from: 'A01', to: 'B07', priority: 40, scheduledAt: new Date().toISOString(), estimatedMinutes: 10, equipmentId: 'RS-02' }), /不能指派/);
+  assert.equal(deleteYardTask(task.id)?.id, task.id);
+});
